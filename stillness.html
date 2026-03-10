@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stillness</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #fff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: monospace;
+    }
+
+    #canvas {
+      display: block;
+      max-width: 100vw;
+      max-height: 100vh;
+    }
+
+    #hud {
+      position: fixed;
+      bottom: 12px;
+      left: 0;
+      right: 0;
+      text-align: center;
+      font-size: 12px;
+      color: #aaa;
+      pointer-events: none;
+    }
+
+    #start-screen {
+      position: fixed;
+      inset: 0;
+      background: #fff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 24px;
+    }
+
+    #start-screen h1 {
+      font-size: 2rem;
+      font-weight: normal;
+      letter-spacing: 0.2em;
+      color: #222;
+    }
+
+    #start-screen p {
+      font-size: 0.85rem;
+      color: #999;
+      max-width: 360px;
+      text-align: center;
+      line-height: 1.6;
+    }
+
+    #start-btn {
+      padding: 12px 36px;
+      border: 1px solid #ccc;
+      background: none;
+      font-family: monospace;
+      font-size: 0.9rem;
+      letter-spacing: 0.1em;
+      cursor: pointer;
+      color: #444;
+      transition: border-color 0.2s, color 0.2s;
+    }
+
+    #start-btn:hover { border-color: #888; color: #111; }
+
+    #controls {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      align-items: flex-end;
+    }
+
+    .ctrl-btn {
+      padding: 6px 14px;
+      border: 1px solid #ddd;
+      background: rgba(255,255,255,0.85);
+      font-family: monospace;
+      font-size: 11px;
+      cursor: pointer;
+      color: #666;
+      transition: border-color 0.15s;
+    }
+
+    .ctrl-btn:hover { border-color: #999; color: #111; }
+
+    #threshold-display {
+      font-size: 11px;
+      color: #aaa;
+      text-align: right;
+      padding: 4px 0;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="start-screen">
+    <h1>stillness</h1>
+    <p>Only things that have been completely still appear.<br>
+       Moving subjects are invisible — the world reveals itself through patience.</p>
+    <button id="start-btn" onclick="startApp()">begin</button>
+  </div>
+
+  <canvas id="canvas"></canvas>
+
+  <div id="controls" style="display:none">
+    <div id="threshold-display">threshold: 5s</div>
+    <button class="ctrl-btn" onclick="adjustThreshold(1)">+ slower</button>
+    <button class="ctrl-btn" onclick="adjustThreshold(-1)">− faster</button>
+    <button class="ctrl-btn" onclick="resetCounters()">reset</button>
+    <button class="ctrl-btn" onclick="saveImage()">save</button>
+  </div>
+
+  <div id="hud"></div>
+
+  <video id="video" autoplay playsinline style="display:none"></video>
+
+  <script>
+    // ── Config ────────────────────────────────────────────────────────────────
+    const STILL_THRESHOLD_SEC = 5.0;
+    const FADE_IN_SEC         = 1.5;
+    const PIXEL_DIFF_THRESH   = 18;
+    const BLUR_RADIUS         = 1;   // simple box blur passes
+
+    // ── State ─────────────────────────────────────────────────────────────────
+    let thresholdSec = STILL_THRESHOLD_SEC;
+    let stillCounter, frozen, prevGray;
+    let width, height, frameCount = 0;
+    let running = false;
+
+    const video  = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx    = canvas.getContext('2d', { willReadFrequently: true });
+    const hud    = document.getElementById('hud');
+
+    // ── Start ─────────────────────────────────────────────────────────────────
+    async function startApp() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        video.srcObject = stream;
+        await new Promise(r => video.onloadedmetadata = r);
+        video.play();
+
+        width  = video.videoWidth;
+        height = video.videoHeight;
+        canvas.width  = width;
+        canvas.height = height;
+
+        const n = width * height;
+        stillCounter = new Float32Array(n);
+        frozen       = new Uint8ClampedArray(n * 4);
+        prevGray     = new Uint8ClampedArray(n);
+
+        // Seed frozen with first frame
+        ctx.drawImage(video, 0, 0, width, height);
+        const seed = ctx.getImageData(0, 0, width, height);
+        frozen.set(seed.data);
+        toGray(seed.data, prevGray);
+
+        document.getElementById('start-screen').style.display = 'none';
+        document.getElementById('controls').style.display = 'flex';
+        running = true;
+        requestAnimationFrame(tick);
+      } catch (e) {
+        alert('Could not access camera: ' + e.message);
+      }
+    }
+
+    // ── Per-frame processing ──────────────────────────────────────────────────
+    function tick() {
+      if (!running) return;
+      requestAnimationFrame(tick);
+
+      ctx.drawImage(video, 0, 0, width, height);
+      const frame   = ctx.getImageData(0, 0, width, height);
+      const pixels  = frame.data;
+      const n       = width * height;
+
+      // Grayscale + blur current frame
+      const currGray = new Uint8ClampedArray(n);
+      toGray(pixels, currGray);
+      boxBlur(currGray, width, height);
+
+      // FPS estimate from video (fallback 30)
+      const fps = 30;
+      const thresholdFrames = thresholdSec * fps;
+      const fadeFrames      = Math.max(FADE_IN_SEC * fps, 1);
+
+      // Output buffer
+      const out = new Uint8ClampedArray(n * 4);
+
+      for (let i = 0; i < n; i++) {
+        const diff = Math.abs(currGray[i] - prevGray[i]);
+        const moved = diff > PIXEL_DIFF_THRESH;
+
+        if (moved) {
+          stillCounter[i] = 0;
+        } else {
+          stillCounter[i] = Math.min(stillCounter[i] + 1, thresholdFrames + fadeFrames);
+        }
+
+        // Update frozen buffer once pixel is fully still
+        if (stillCounter[i] >= thresholdFrames + fadeFrames) {
+          const p = i * 4;
+          frozen[p]     = pixels[p];
+          frozen[p + 1] = pixels[p + 1];
+          frozen[p + 2] = pixels[p + 2];
+          frozen[p + 3] = 255;
+        }
+
+        // Alpha: blend live → frozen during fade window
+        const alpha = Math.min(Math.max((stillCounter[i] - thresholdFrames) / fadeFrames, 0), 1);
+        const p = i * 4;
+        out[p]     = Math.round(pixels[p]     * alpha + frozen[p]     * (1 - alpha));
+        out[p + 1] = Math.round(pixels[p + 1] * alpha + frozen[p + 1] * (1 - alpha));
+        out[p + 2] = Math.round(pixels[p + 2] * alpha + frozen[p + 2] * (1 - alpha));
+        out[p + 3] = 255;
+      }
+
+      prevGray.set(currGray);
+
+      const outImg = new ImageData(out, width, height);
+      ctx.putImageData(outImg, 0, 0);
+
+      frameCount++;
+      if (frameCount % 30 === 0) {
+        hud.textContent = `threshold: ${thresholdSec}s  ·  reset: R  ·  save: S`;
+      }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    function toGray(pixels, out) {
+      for (let i = 0; i < out.length; i++) {
+        const p = i * 4;
+        out[i] = (pixels[p] * 77 + pixels[p + 1] * 150 + pixels[p + 2] * 29) >> 8;
+      }
+    }
+
+    function boxBlur(gray, w, h) {
+      // Single horizontal + vertical pass (fast approximation)
+      const tmp = new Uint8ClampedArray(gray.length);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const x0 = Math.max(x - 1, 0), x1 = Math.min(x + 1, w - 1);
+          tmp[y * w + x] = (gray[y * w + x0] + gray[y * w + x] + gray[y * w + x1]) / 3;
+        }
+      }
+      for (let y = 0; y < h; y++) {
+        const y0 = Math.max(y - 1, 0), y1 = Math.min(y + 1, h - 1);
+        for (let x = 0; x < w; x++) {
+          gray[y * w + x] = (tmp[y0 * w + x] + tmp[y * w + x] + tmp[y1 * w + x]) / 3;
+        }
+      }
+    }
+
+    // ── Controls ──────────────────────────────────────────────────────────────
+    function adjustThreshold(delta) {
+      thresholdSec = Math.min(Math.max(thresholdSec + delta, 1), 120);
+      document.getElementById('threshold-display').textContent = `threshold: ${thresholdSec}s`;
+    }
+
+    function resetCounters() {
+      if (!stillCounter) return;
+      stillCounter.fill(0);
+      ctx.drawImage(video, 0, 0, width, height);
+      const f = ctx.getImageData(0, 0, width, height);
+      frozen.set(f.data);
+    }
+
+    function saveImage() {
+      const a = document.createElement('a');
+      a.download = `stillness_${Date.now()}.png`;
+      a.href = canvas.toDataURL('image/png');
+      a.click();
+    }
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', e => {
+      if (!running) return;
+      const k = e.key.toLowerCase();
+      if (k === '+' || k === '=') adjustThreshold(1);
+      if (k === '-')              adjustThreshold(-1);
+      if (k === 'r' || k === ' ') resetCounters();
+      if (k === 's')              saveImage();
+    });
+  </script>
+</body>
+</html>
